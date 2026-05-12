@@ -46,6 +46,19 @@ pub extern "C" fn _start() -> ! {
         Ok(())                         => println!("exfat mounted"),
         Err(e)                         => println!("exfat error: {:?}", e),
     }
+    
+    let mut motd_buf = [0u8; 512];
+    if let Ok(n) = exfat::read(b"etc/motd", &mut motd_buf) {
+        let p = vga::palette();
+        let mut w = vga::WRITER.lock();
+        w.set_color(p.info);
+        for &b in &motd_buf[..n as usize] {
+            if b == b'\n' { w.write_byte(b'\n'); }
+            else if b >= 0x20 && b < 0x7f { w.write_byte(b); }
+        }
+        w.write_byte(b'\n');
+        w.reset_color();
+    }
 
     print_prompt();
     let (mut input_row, mut input_col) = vga::WRITER.lock().cursor_pos();
@@ -206,18 +219,6 @@ pub fn draw_banner() {
     for &b in b"\n Type 'help' for available commands.\n\n" { w.write_byte(b); }
     w.reset_color();
     drop(w);
-
-    let mut motd_buf = [0u8; 512];
-    if let Ok(n) = crate::exfat::read(b"etc/motd", &mut motd_buf) {
-        let mut w = vga::WRITER.lock();
-        w.set_color(p.info);
-        for &b in &motd_buf[..n as usize] {
-            if b == b'\n' { w.write_byte(b'\n'); }
-            else if b >= 0x20 && b < 0x7f { w.write_byte(b); }
-        }
-        w.write_byte(b'\n');
-        w.reset_color();
-    }
 }
 fn print_prompt() {
     let p = vga::palette();
