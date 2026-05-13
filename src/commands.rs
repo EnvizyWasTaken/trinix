@@ -1,5 +1,6 @@
 use crate::{env, history, process, vga, println, print};
 
+
 pub struct Command {
     pub name: &'static str,
     pub desc: &'static str,
@@ -34,6 +35,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "mfd", desc: "move or rename: mfd <source> <dest>" },
     Command { name: "crd", desc: "create directory: crd <name>" },
     Command { name: "edit", desc: "overwrite file contents: edit <name>" },
+    Command { name: "panic", desc: "invokes kernel panic" },
 ];
 
 pub fn run(name: &[u8], args: &[u8]) -> i32 {
@@ -66,6 +68,7 @@ pub fn run(name: &[u8], args: &[u8]) -> i32 {
         b"mfd" => cmd_mfd(args),
         b"crd" => cmd_crd(args),
         b"edit" => cmd_edit(args),
+        b"panic" => { cmd_panic();                    0 }
         _ => {
             vga::WRITER.lock().set_color(vga::palette().error);
             if let Ok(s) = core::str::from_utf8(name) {
@@ -75,6 +78,12 @@ pub fn run(name: &[u8], args: &[u8]) -> i32 {
             127
         }
     }
+}
+
+fn cmd_panic() {
+    vga::WRITER.lock().set_color(vga::color(vga::Color::White, vga::Color::Red));
+    println!("\n KERNEL PANIC ");
+    loop {}
 }
 
 fn cmd_help() {
