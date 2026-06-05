@@ -1,3 +1,4 @@
+#[allow(unsafe_op_in_unsafe_fn)]
 use x86_64::instructions::port::Port;
 
 const PORT_DATA:         u16 = 0x1F0;

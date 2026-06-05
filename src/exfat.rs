@@ -207,6 +207,35 @@ impl ExFatInner {
         }
     }
 
+    fn resolve_dir(&self, path: &[u8]) -> Result<u32, ExFatError> {
+        let mut cluster = self.vol.root_cluster;
+        let mut start   = 0usize;
+        while start < path.len() {
+            let end = path[start..].iter().position(|&b| b == b'/')
+                .map(|i| start + i).unwrap_or(path.len());
+            let component = &path[start..end];
+            start = end + 1;
+            if component.is_empty() { continue; }
+            let entry = self.find_in_dir(cluster, component)?;
+            if !entry.is_dir { return Err(ExFatError::NotADirectory); }
+            cluster = entry.first_cluster;
+        }
+        Ok(cluster)
+    }
+
+    fn resolve_parent<'a>(&self, path: &'a [u8]) -> Result<(u32, &'a [u8]), ExFatError> {
+        let path = if path.first() == Some(&b'/') { &path[1..] } else { path };
+        match path.iter().rposition(|&b| b == b'/') {
+            None    => Ok((self.vol.root_cluster, path)),
+            Some(i) => {
+                let dir_part = &path[..i];
+                let filename = &path[i + 1..];
+                let cluster  = self.resolve_dir(dir_part)?;
+                Ok((cluster, filename))
+            }
+        }
+    }
+
     fn process_entry(e: &[u8], state: &mut ParseState) -> Option<DirEntry> {
         match e[0] {
             ENTRY_EOD => {}
@@ -539,6 +568,31 @@ impl ExFatInner {
         Ok(written as u64)
     }
 
+    pub fn read_path(&self, path: &[u8], buf: &mut [u8]) -> Result<u64, ExFatError> {
+        if !self.present { return Err(ExFatError::NotExFat); }
+        let (dir_cluster, filename) = self.resolve_parent(path)?;
+        let entry   = self.find_in_dir(dir_cluster, filename)?;
+        let to_read = (entry.size as usize).min(buf.len());
+        let mut written = 0usize;
+        let mut cluster = entry.first_cluster;
+        'outer: loop {
+            let base = self.cluster_to_lba(cluster);
+            for s in 0..self.vol.sectors_per_cluster {
+                if written >= to_read { break 'outer; }
+                let mut sector_buf = [0u8; 512];
+                ata::read(base + s, &mut sector_buf)?;
+                let chunk = (to_read - written).min(512);
+                buf[written..written + chunk].copy_from_slice(&sector_buf[..chunk]);
+                written += chunk;
+            }
+            match self.fat_next(cluster)? {
+                Some(next) => cluster = next,
+                None       => break,
+            }
+        }
+        Ok(written as u64)
+    }
+
     pub fn create(&self, name: &[u8], data: &[u8]) -> Result<(), ExFatError> {
         if !self.present               { return Err(ExFatError::NotExFat); }
         if name.len() > 255            { return Err(ExFatError::NameTooLong); }
@@ -572,6 +626,43 @@ impl ExFatInner {
         }
 
         self.append_dir_entry(self.current_cluster, name, first_cluster, data.len() as u64)
+    }
+
+    pub fn create_path(&self, path: &[u8], data: &[u8]) -> Result<(), ExFatError> {
+        if !self.present               { return Err(ExFatError::NotExFat); }
+        if self.vol.bitmap_cluster == 0 { return Err(ExFatError::NoSpace); }
+
+        let (dir_cluster, filename) = self.resolve_parent(path)?;
+        if filename.len() > 255 { return Err(ExFatError::NameTooLong); }
+
+        let bytes_per_cluster = self.vol.sectors_per_cluster as usize * 512;
+        let clusters_needed   = ((data.len() + bytes_per_cluster - 1) / bytes_per_cluster).max(1);
+
+        let first_cluster = self.alloc_cluster()?;
+        let mut prev = first_cluster;
+        for _ in 1..clusters_needed {
+            let next = self.alloc_cluster()?;
+            self.fat_write(prev, next)?;
+            prev = next;
+        }
+
+        let mut cluster         = first_cluster;
+        let mut offset          = 0usize;
+        let mut sector_in_clust = 0u32;
+        while offset < data.len() {
+            let mut sector_buf = [0u8; 512];
+            let end = (offset + 512).min(data.len());
+            sector_buf[..end - offset].copy_from_slice(&data[offset..end]);
+            ata::write(self.cluster_to_lba(cluster) + sector_in_clust, &sector_buf)?;
+            offset          += end - offset;
+            sector_in_clust += 1;
+            if sector_in_clust >= self.vol.sectors_per_cluster {
+                sector_in_clust = 0;
+                if let Some(next) = self.fat_next(cluster)? { cluster = next; }
+            }
+        }
+
+        self.append_dir_entry(dir_cluster, filename, first_cluster, data.len() as u64)
     }
 
     pub fn create_dir(&self, name: &[u8]) -> Result<(), ExFatError> {
@@ -614,6 +705,18 @@ impl ExFatInner {
         Ok(())
     }
 
+    pub fn delete_path(&self, path: &[u8]) -> Result<(), ExFatError> {
+        if !self.present { return Err(ExFatError::NotExFat); }
+        let (dir_cluster, filename) = self.resolve_parent(path)?;
+        let entry                   = self.find_in_dir(dir_cluster, filename)?;
+        let (set_start, set_count)  = self.find_entry_set_index(dir_cluster, filename)?;
+        self.free_chain(entry.first_cluster)?;
+        for i in 0..set_count {
+            self.mark_entry_deleted(dir_cluster, set_start + i)?;
+        }
+        Ok(())
+    }
+
     pub fn move_entry(&self, src: &[u8], dst: &[u8]) -> Result<(), ExFatError> {
         if !self.present { return Err(ExFatError::NotExFat); }
         let entry                  = self.find_in_dir(self.current_cluster, src)?;
@@ -650,12 +753,15 @@ fn name_hash(name: &[u8]) -> u16 {
 
 static FS: Mutex<ExFatInner> = Mutex::new(ExFatInner::new());
 
-pub fn init()                            -> Result<(), ExFatError>       { FS.lock().init() }
-pub fn ls(out: &mut [DirEntry])          -> Result<usize, ExFatError>    { FS.lock().ls(out) }
-pub fn find(name: &[u8])                 -> Result<DirEntry, ExFatError> { FS.lock().find(name) }
-pub fn read(name: &[u8], buf: &mut [u8]) -> Result<u64, ExFatError>      { FS.lock().read(name, buf) }
-pub fn create(name: &[u8], data: &[u8])  -> Result<(), ExFatError>       { FS.lock().create(name, data) }
-pub fn create_dir(name: &[u8])           -> Result<(), ExFatError>       { FS.lock().create_dir(name) }
-pub fn delete(name: &[u8])               -> Result<(), ExFatError>       { FS.lock().delete(name) }
-pub fn move_file(src: &[u8], dst: &[u8]) -> Result<(), ExFatError>       { FS.lock().move_entry(src, dst) }
-pub fn chdir(name: &[u8])                -> Result<(), ExFatError>       { FS.lock().chdir(name) }
+pub fn init()                                -> Result<(), ExFatError>       { FS.lock().init() }
+pub fn ls(out: &mut [DirEntry])              -> Result<usize, ExFatError>    { FS.lock().ls(out) }
+pub fn find(name: &[u8])                     -> Result<DirEntry, ExFatError> { FS.lock().find(name) }
+pub fn read(name: &[u8], buf: &mut [u8])     -> Result<u64, ExFatError>      { FS.lock().read(name, buf) }
+pub fn read_path(path: &[u8], buf: &mut [u8]) -> Result<u64, ExFatError>     { FS.lock().read_path(path, buf) }
+pub fn create(name: &[u8], data: &[u8])      -> Result<(), ExFatError>       { FS.lock().create(name, data) }
+pub fn create_path(path: &[u8], data: &[u8]) -> Result<(), ExFatError>       { FS.lock().create_path(path, data) }
+pub fn create_dir(name: &[u8])               -> Result<(), ExFatError>       { FS.lock().create_dir(name) }
+pub fn delete(name: &[u8])                   -> Result<(), ExFatError>       { FS.lock().delete(name) }
+pub fn delete_path(path: &[u8])              -> Result<(), ExFatError>       { FS.lock().delete_path(path) }
+pub fn move_file(src: &[u8], dst: &[u8])     -> Result<(), ExFatError>       { FS.lock().move_entry(src, dst) }
+pub fn chdir(name: &[u8])                    -> Result<(), ExFatError>       { FS.lock().chdir(name) }

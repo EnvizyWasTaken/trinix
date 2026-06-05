@@ -26,16 +26,17 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "true",     desc: "return exit code 0" },
     Command { name: "false",    desc: "return exit code 1" },
     Command { name: "peek",     desc: "hex dump memory: peek <addr> [len]" },
-    Command { name: "ldf", desc: "list files and directories" },
+    Command { name: "ls", desc: "list files and directories" },
     Command { name: "diskinfo", desc: "show disk and filesystem diagnostic info" },
-    Command { name: "rf",  desc: "read file: rf <name>" },
-    Command { name: "nf",  desc: "new file: nf <name> <content>" },
+    Command { name: "cat",  desc: "read file: rf <name>" },
+    Command { name: "touch",  desc: "new file: nf <name> <content>" },
     Command { name: "cd",  desc: "change directory: cd <dir>" },
-    Command { name: "df",  desc: "delete file: df <name>" },
-    Command { name: "mfd", desc: "move or rename: mfd <source> <dest>" },
-    Command { name: "crd", desc: "create directory: crd <name>" },
+    Command { name: "rm",  desc: "delete file or directory: df <name>" },
+    Command { name: "mv", desc: "move or rename: mfd <source> <dest>" },
+    Command { name: "mkdir", desc: "create directory: crd <name>" },
     Command { name: "edit", desc: "overwrite file contents: edit <name>" },
     Command { name: "panic", desc: "invokes kernel panic" },
+    Command { name: "dmesg", desc: "show boot log" },
 ];
 
 pub fn run(name: &[u8], args: &[u8]) -> i32 {
@@ -59,16 +60,17 @@ pub fn run(name: &[u8], args: &[u8]) -> i32 {
         b"true"     =>                            0,
         b"false"    =>                            1,
         b"peek"     => cmd_peek(args),
-        b"ldf" => { cmd_ldf();                    0 }
+        b"ls" => { cmd_ldf();                    0 }
         b"diskinfo" => { cmd_diskinfo(); 0 }
-        b"rf"  => { cmd_rf(args);  0 }
-        b"nf"  => cmd_nf(args),
+        b"cat"  => { cmd_rf(args);  0 }
+        b"touch"  => cmd_nf(args),
         b"cd"  => { cmd_cd(args);  0 }
-        b"df"  => cmd_df(args),
-        b"mfd" => cmd_mfd(args),
-        b"crd" => cmd_crd(args),
+        b"rm"  => cmd_df(args),
+        b"mv" => cmd_mfd(args),
+        b"mkdir" => cmd_crd(args),
         b"edit" => cmd_edit(args),
         b"panic" => { cmd_panic();                    0 }
+        b"dmesg" => { cmd_dmesg(); 0 }
         _ => {
             vga::WRITER.lock().set_color(vga::palette().error);
             if let Ok(s) = core::str::from_utf8(name) {
@@ -122,7 +124,29 @@ fn cmd_clear() {
 }
 
 fn cmd_version() {
-    println!("Trinix OS v0.1.0");
+    let mut buf = [0u8; 256];
+    match crate::exfat::read(b"etc/os-release", &mut buf) {
+        Ok(n) => {
+            let p = vga::palette();
+            let data = &buf[..n as usize];
+            let mut pos = 0usize;
+            while pos < data.len() {
+                let end = data[pos..].iter().position(|&b| b == b'\n')
+                    .map(|i| pos + i).unwrap_or(data.len());
+                let line = &data[pos..end];
+                pos = end + 1;
+                if let Some(eq) = line.iter().position(|&b| b == b'=') {
+                    let key = &line[..eq];
+                    let val = &line[eq + 1..];
+                    vga::WRITER.lock().set_color(p.prompt);
+                    if let Ok(k) = core::str::from_utf8(key) { print!("{}: ", k); }
+                    vga::WRITER.lock().reset_color();
+                    if let Ok(v) = core::str::from_utf8(val) { println!("{}", v); }
+                }
+            }
+        }
+        Err(_) => println!("Trinix OS v0.1.0"),
+    }
 }
 
 fn cmd_uname(args: &[u8]) {
@@ -131,16 +155,34 @@ fn cmd_uname(args: &[u8]) {
     let rel  = all || args == b"-r";
     let mach = all || args == b"-m";
 
+    let mut buf = [0u8; 256];
+    let (name, version) = if crate::exfat::read(b"etc/os-release", &mut buf).is_ok() {
+        let mut n = b"Trinix" as &[u8];
+        let mut v = b"0.1.0"  as &[u8];
+        let mut pos = 0usize;
+        while pos < buf.len() {
+            let end = buf[pos..].iter().position(|&b| b == b'\n')
+                .map(|i| pos + i).unwrap_or(buf.len());
+            let line = &buf[pos..end];
+            pos = end + 1;
+            if line.starts_with(b"NAME=")    { n = &line[5..]; }
+            if line.starts_with(b"VERSION=") { v = &line[8..]; }
+        }
+        (n, v)
+    } else {
+        (b"Trinix" as &[u8], b"0.1.0" as &[u8])
+    };
+
     let mut first = true;
-    let mut put = |s: &str| {
+    let mut put = |s: &[u8]| {
         if !first { print!(" "); }
-        print!("{}", s);
+        if let Ok(s) = core::str::from_utf8(s) { print!("{}", s); }
         first = false;
     };
 
-    if kern { put("Trinix"); }
-    if rel  { put("0.1.0"); }
-    if mach { put("x86_64"); }
+    if kern { put(name); }
+    if rel  { put(version); }
+    if mach { put(b"x86_64"); }
     println!();
 }
 
@@ -234,6 +276,26 @@ fn cmd_rf(args: &[u8]) {
                 else if b >= 0x20 && b < 0x7f { print!("{}", b as char); }
             }
             println!();
+        }
+    }
+}
+
+fn cmd_dmesg() {
+    let p = vga::palette();
+    let mut buf = [0u8; 4096];
+    match crate::exfat::read(b"var/log/boot.log", &mut buf) {
+        Ok(n) => {
+            vga::WRITER.lock().set_color(p.dim);
+            for &b in &buf[..n as usize] {
+                if b == b'\n' { println!(); }
+                else if b >= 0x20 && b < 0x7f { print!("{}", b as char); }
+            }
+            vga::WRITER.lock().reset_color();
+        }
+        Err(_) => {
+            vga::WRITER.lock().set_color(p.error);
+            println!("no boot log found");
+            vga::WRITER.lock().reset_color();
         }
     }
 }

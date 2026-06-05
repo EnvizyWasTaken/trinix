@@ -14,7 +14,7 @@ mod vga;
 mod exfat;
 mod ata;
 mod config;
-
+mod auth;
 
 use core::panic::PanicInfo;
 use keyboard::{Key, Keyboard};
@@ -32,23 +32,23 @@ pub extern "C" fn _start() -> ! {
     env::ENV.lock().init();
 
     vga::WRITER.lock().clear();
-
-    config::load();
     draw_banner();
 
     match ata::init() {
-        Ok(())                         => println!("disk ok"),
-        Err(ata::AtaError::NoDevice)   => println!("no disk"),
-        Err(e)                         => println!("disk error: {:?}", e),
+        Ok(())                       => { println!("disk ok");             config::log_boot(b"ata: ok"); }
+        Err(ata::AtaError::NoDevice) => { println!("no disk");            config::log_boot(b"ata: no device"); }
+        Err(e)                       => { println!("disk error: {:?}", e); config::log_boot(b"ata: error"); }
     }
 
     match exfat::init() {
-        Ok(())                         => println!("exfat mounted"),
-        Err(e)                         => println!("exfat error: {:?}", e),
+        Ok(())  => { println!("exfat mounted"); config::log_boot(b"exfat: mounted"); }
+        Err(e)  => { println!("exfat error: {:?}", e); config::log_boot(b"exfat: error"); }
     }
-    
+
+    config::load();
+
     let mut motd_buf = [0u8; 512];
-    if let Ok(n) = exfat::read(b"etc/motd", &mut motd_buf) {
+    if let Ok(n) = exfat::read_path(b"etc/motd", &mut motd_buf) {
         let p = vga::palette();
         let mut w = vga::WRITER.lock();
         w.set_color(p.info);
@@ -58,6 +58,10 @@ pub extern "C" fn _start() -> ! {
         }
         w.write_byte(b'\n');
         w.reset_color();
+    }
+
+    if !do_login() {
+        loop { x86_64::instructions::hlt(); }
     }
 
     print_prompt();
@@ -168,6 +172,99 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
+fn do_login() -> bool {
+    let p = vga::palette();
+    let mut attempts = 0u8;
+    loop {
+        vga::WRITER.lock().set_color(p.prompt);
+        print!("login: ");
+        vga::WRITER.lock().reset_color();
+        let username = read_line();
+        let ulen = username.iter().position(|&b| b == 0).unwrap_or(256);
+
+        vga::WRITER.lock().set_color(p.prompt);
+        print!("password: ");
+        vga::WRITER.lock().reset_color();
+        let password = read_password();
+        let plen = password.iter().position(|&b| b == 0).unwrap_or(256);
+
+        if auth::authenticate(&username[..ulen], &password[..plen]) {
+            env::ENV.lock().set(b"USER", &username[..ulen]);
+            if &username[..ulen] == b"root" {
+                env::ENV.lock().set(b"HOME", b"/root");
+            } else {
+                env::ENV.lock().set(b"HOME", b"/home");
+            }
+            vga::WRITER.lock().set_color(p.success);
+            if let Ok(s) = core::str::from_utf8(&username[..ulen]) {
+                println!("welcome {}!", s);
+            }
+            vga::WRITER.lock().reset_color();
+            return true;
+        }
+
+        attempts += 1;
+        vga::WRITER.lock().set_color(p.error);
+        println!("incorrect password.");
+        vga::WRITER.lock().reset_color();
+
+        if attempts >= 3 {
+            vga::WRITER.lock().set_color(p.error);
+            println!("too many failed attempts.");
+            vga::WRITER.lock().reset_color();
+            return false;
+        }
+    }
+}
+
+pub fn read_line() -> [u8; 256] {
+    let mut buf = [0u8; 256];
+    let mut len = 0usize;
+    loop {
+        let key = KEYBOARD.lock().read_key();
+        let Some(key) = key else { continue };
+        match key {
+            Key::Char(b'\n') => { println!(); break; }
+            Key::Char(0x08) | Key::Char(0x7F) => {
+                if len > 0 {
+                    len -= 1;
+                    buf[len] = 0;
+                    vga::WRITER.lock().backspace();
+                }
+            }
+            Key::Char(ch) if ch >= 0x20 => {
+                if len < 255 {
+                    buf[len] = ch;
+                    len += 1;
+                    print!("{}", ch as char);
+                }
+            }
+            _ => {}
+        }
+    }
+    buf
+}
+
+pub fn read_password() -> [u8; 256] {
+    let mut buf = [0u8; 256];
+    let mut len = 0usize;
+    loop {
+        let key = KEYBOARD.lock().read_key();
+        let Some(key) = key else { continue };
+        match key {
+            Key::Char(b'\n') => { println!(); break; }
+            Key::Char(0x08) | Key::Char(0x7F) => {
+                if len > 0 { len -= 1; buf[len] = 0; }
+            }
+            Key::Char(ch) if ch >= 0x20 => {
+                if len < 255 { buf[len] = ch; len += 1; }
+            }
+            _ => {}
+        }
+    }
+    buf
+}
+
 fn redraw_input(row: usize, start_col: usize) {
     let mut line_buf = [0u8; 256];
     let (len, cursor) = {
@@ -218,8 +315,8 @@ pub fn draw_banner() {
     w.set_color(p.dim);
     for &b in b"\n Type 'help' for available commands.\n\n" { w.write_byte(b); }
     w.reset_color();
-    drop(w);
 }
+
 fn print_prompt() {
     let p = vga::palette();
     {
